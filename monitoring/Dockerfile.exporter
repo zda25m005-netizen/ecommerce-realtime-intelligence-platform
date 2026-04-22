@@ -1,0 +1,11 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    prometheus-client==0.19.0 \
+    kafka-python==2.0.2
+
+COPY metrics_exporter.py /app/
+
+CMD ["python", "metrics_exporter.py"]

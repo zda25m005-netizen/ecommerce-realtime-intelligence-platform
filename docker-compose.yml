@@ -1,0 +1,352 @@
+# =============================================================================
+# Real-Time E-Commerce Intelligence Platform
+# Z5008 Big Data Lab - IIT Madras Zanzibar
+# Gaurav Jha | ZDA25M005
+# =============================================================================
+
+x-spark-common: &spark-common
+  image: apache/spark:3.5.3
+  environment:
+    - SPARK_WORKER_MEMORY=2G
+    - SPARK_WORKER_CORES=2
+  networks:
+    - ecommerce-net
+  depends_on:
+    - spark-master
+
+services:
+  # ===========================================================================
+  # LAYER 1: DATA INGESTION - Apache Kafka
+  # ===========================================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - ecommerce-net
+    mem_limit: 512m
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_MESSAGE_MAX_BYTES: 1048576
+    networks:
+      - ecommerce-net
+    mem_limit: 1g
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-init
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      echo 'Waiting for Kafka to be ready...'
+      cub kafka-ready -b kafka:9092 1 60
+
+      echo 'Creating Kafka topics...'
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --topic clickstream
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --topic inventory
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --topic user_events
+
+      echo 'Topics created:'
+      kafka-topics --list --bootstrap-server kafka:9092
+      "
+    networks:
+      - ecommerce-net
+
+  # ===========================================================================
+  # LAYER 2: OBJECT STORAGE - MinIO (S3-compatible)
+  # ===========================================================================
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minio_admin
+      MINIO_ROOT_PASSWORD: minio_password
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - ecommerce-net
+    mem_limit: 1g
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      - minio
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      sleep 5
+      mc alias set local http://minio:9000 minio_admin minio_password
+      mc mb local/bronze --ignore-existing
+      mc mb local/silver --ignore-existing
+      mc mb local/gold --ignore-existing
+      mc mb local/mlflow --ignore-existing
+      mc mb local/checkpoints --ignore-existing
+      echo 'MinIO buckets created successfully'
+      mc ls local/
+      "
+    networks:
+      - ecommerce-net
+
+  # ===========================================================================
+  # LAYER 3: PROCESSING - Apache Spark (Master + Worker)
+  # ===========================================================================
+  spark-master:
+    image: apache/spark:3.5.3
+    container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark:/opt/spark-apps
+      - ./ml:/opt/ml
+      - ./data:/opt/data
+      - spark-warehouse:/opt/spark-warehouse
+    networks:
+      - ecommerce-net
+    mem_limit: 2g
+
+  spark-worker:
+    image: apache/spark:3.5.3
+    container_name: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_WEBUI_PORT=8085
+    volumes:
+      - ./spark:/opt/spark-apps
+      - ./ml:/opt/ml
+      - ./data:/opt/data
+      - spark-warehouse:/opt/spark-warehouse
+    networks:
+      - ecommerce-net
+    mem_limit: 2g
+
+  # ===========================================================================
+  # LAYER 4: ORCHESTRATION - Apache Airflow
+  # ===========================================================================
+  airflow-postgres:
+    image: postgres:15
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-pg-data:/var/lib/postgresql/data
+    networks:
+      - ecommerce-net
+    mem_limit: 512m
+
+  airflow-webserver:
+    image: apache/airflow:2.8.1-python3.10
+    container_name: airflow-webserver
+    depends_on:
+      - airflow-postgres
+    environment: &airflow-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+      AIRFLOW__WEBSERVER__RBAC: 'true'
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - airflow-logs:/opt/airflow/logs
+    ports:
+      - "8082:8080"
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin || true &&
+        airflow webserver
+      "
+    networks:
+      - ecommerce-net
+    mem_limit: 1g
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.1-python3.10
+    container_name: airflow-scheduler
+    depends_on:
+      - airflow-webserver
+    environment: *airflow-env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - airflow-logs:/opt/airflow/logs
+    command: airflow scheduler
+    networks:
+      - ecommerce-net
+    mem_limit: 1g
+
+  # ===========================================================================
+  # LAYER 6: EXPERIMENT TRACKING - MLflow
+  # ===========================================================================
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.0
+    container_name: mlflow
+    ports:
+      - "5001:5000"
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minio_admin
+      AWS_SECRET_ACCESS_KEY: minio_password
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri sqlite:///mlflow/mlflow.db
+        --default-artifact-root s3://mlflow/
+    volumes:
+      - mlflow-data:/mlflow
+    networks:
+      - ecommerce-net
+    mem_limit: 512m
+
+  # ===========================================================================
+  # LAYER 7: MODEL SERVING - BentoML
+  # ===========================================================================
+  bentoml-server:
+    build:
+      context: ./bentoml
+      dockerfile: docker/Dockerfile
+    container_name: bentoml-server
+    ports:
+      - "3001:3001"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minio_admin
+      AWS_SECRET_ACCESS_KEY: minio_password
+      BENTOML_PORT: 3001
+    depends_on:
+      - mlflow
+      - minio
+    networks:
+      - ecommerce-net
+    mem_limit: 1g
+
+  # ===========================================================================
+  # LAYER 8: MONITORING - Prometheus + Grafana
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+    networks:
+      - ecommerce-net
+    mem_limit: 512m
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - ecommerce-net
+    mem_limit: 512m
+
+  # ===========================================================================
+  # METRICS EXPORTER - Custom Python exporter for business metrics
+  # ===========================================================================
+  metrics-exporter:
+    build:
+      context: ./monitoring
+      dockerfile: Dockerfile.exporter
+    container_name: metrics-exporter
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      - kafka
+      - prometheus
+    networks:
+      - ecommerce-net
+    mem_limit: 256m
+
+  # ===========================================================================
+  # BONUS: OLLAMA - Local LLM for NL Query Interface
+  # ===========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - ecommerce-net
+    mem_limit: 4g
+
+networks:
+  ecommerce-net:
+    driver: bridge
+
+volumes:
+  minio-data:
+  spark-warehouse:
+  airflow-pg-data:
+  airflow-logs:
+  mlflow-data:
+  prometheus-data:
+  grafana-data:
+  ollama-data:
